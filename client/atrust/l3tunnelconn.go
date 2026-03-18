@@ -2,7 +2,6 @@ package atrust
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
@@ -29,7 +28,6 @@ const (
 	cmdDataResp      = 0x94
 	cmdHeartbeatReq  = 0x15
 	cmdHeartbeatResp = 0x95
-	cmdSecondVipReq  = 0x16
 	cmdSecondVipResp = 0x96
 )
 
@@ -461,7 +459,7 @@ func (c *l3TunnelConn) writeRaw(label string, data []byte) error {
 
 func buildAuthRequest(info clientInfo, signKey []byte, meta packetMeta, ct *conntrack) ([]byte, error) {
 	url := fmt.Sprintf("%s:%s:%d", protoName(meta.proto), meta.dstIP.String(), meta.dstPort)
-	env := defaultEnv(info)
+	env := defaultEnv()
 
 	req := authRequestIP{
 		Sid:           info.sid,
@@ -493,7 +491,7 @@ func buildAuthRequest(info clientInfo, signKey []byte, meta packetMeta, ct *conn
 	return json.Marshal(req)
 }
 
-func defaultEnv(info clientInfo) *trustEnv {
+func defaultEnv() *trustEnv {
 	procPath := "/usr/bin/zju-connect"
 	procName := "zju-connect"
 	fingerprint := fmt.Sprintf("%X", sha256.Sum256([]byte(procPath)))
@@ -513,28 +511,6 @@ func defaultEnv(info clientInfo) *trustEnv {
 	env.Application.Runtime.Process.SecurityEnv = "normal"
 	env.Application.Runtime.ProcessTrusted = "TRUSTED"
 	return &env
-}
-
-func encodeMeta(meta packetMeta) ([]byte, error) {
-	srcIP := meta.srcIP.To4()
-	dstIP := meta.dstIP.To4()
-	if meta.atype == 4 && (srcIP == nil || dstIP == nil) {
-		return nil, fmt.Errorf("invalid ipv4 addr")
-	}
-
-	buf := bytes.NewBuffer(nil)
-	buf.WriteByte(byte(meta.atype))
-	buf.WriteByte(byte(meta.proto))
-	if meta.atype == 4 {
-		buf.Write(srcIP)
-		buf.Write(dstIP)
-	} else {
-		buf.Write(meta.srcIP.To16())
-		buf.Write(meta.dstIP.To16())
-	}
-	_ = binary.Write(buf, binary.BigEndian, meta.srcPort)
-	_ = binary.Write(buf, binary.BigEndian, meta.dstPort)
-	return buf.Bytes(), nil
 }
 
 func buildDataPayload(token string, packets [][]byte) []byte {
@@ -649,54 +625,6 @@ func readDataRespPayload(r *bufio.Reader) ([]byte, string, error) {
 		payload = append(payload, pkt...)
 	}
 	return payload, "token", nil
-}
-
-func parseDataMeta(payload []byte) (packetMeta, int, error) {
-	if len(payload) < 1 {
-		return packetMeta{}, 0, fmt.Errorf("payload too short for meta")
-	}
-	metaLen := int(payload[0])
-	if metaLen == 0 {
-		return packetMeta{}, 0, fmt.Errorf("meta length is zero")
-	}
-	if len(payload) < 1+metaLen {
-		return packetMeta{}, metaLen, fmt.Errorf("payload meta overflow")
-	}
-	metaBytes := payload[1 : 1+metaLen]
-	meta, err := decodeMeta(metaBytes)
-	return meta, metaLen, err
-}
-
-func decodeMeta(metaBytes []byte) (packetMeta, error) {
-	if len(metaBytes) < 2 {
-		return packetMeta{}, fmt.Errorf("meta too short")
-	}
-	meta := packetMeta{
-		atype: int(metaBytes[0]),
-		proto: int(metaBytes[1]),
-	}
-	offset := 2
-	if meta.atype == 4 {
-		if len(metaBytes) < offset+8+4 {
-			return packetMeta{}, fmt.Errorf("meta ipv4 too short")
-		}
-		meta.srcIP = net.IPv4(metaBytes[offset], metaBytes[offset+1], metaBytes[offset+2], metaBytes[offset+3])
-		offset += 4
-		meta.dstIP = net.IPv4(metaBytes[offset], metaBytes[offset+1], metaBytes[offset+2], metaBytes[offset+3])
-		offset += 4
-	} else {
-		if len(metaBytes) < offset+32+4 {
-			return packetMeta{}, fmt.Errorf("meta ipv6 too short")
-		}
-		meta.srcIP = net.IP(metaBytes[offset : offset+16])
-		offset += 16
-		meta.dstIP = net.IP(metaBytes[offset : offset+16])
-		offset += 16
-	}
-	meta.srcPort = binary.BigEndian.Uint16(metaBytes[offset : offset+2])
-	offset += 2
-	meta.dstPort = binary.BigEndian.Uint16(metaBytes[offset : offset+2])
-	return meta, nil
 }
 
 func formatMeta(meta packetMeta) string {

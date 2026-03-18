@@ -30,18 +30,6 @@ func newConntrackMgr() *conntrackMgr {
 	}
 }
 
-func (m *conntrackMgr) getByKey(key string) *conntrack {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.byKey[key]
-}
-
-func (m *conntrackMgr) getByID(authID uint64) *conntrack {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.byID[authID]
-}
-
 func (m *conntrackMgr) getOrCreate(key, appID, nodeGroupID string) *conntrack {
 	m.mu.Lock()
 	defer m.mu.Unlock()

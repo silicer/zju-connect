@@ -1,11 +1,9 @@
 package atrust
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
@@ -14,150 +12,11 @@ import (
 	"io"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/mythologyli/zju-connect/client"
 	"github.com/mythologyli/zju-connect/log"
 	"github.com/mythologyli/zju-connect/resolve"
 )
-
-type tcpTunnelConn struct {
-	tlsConn *tls.Conn
-	reader  *bufio.Reader
-	readBuf []byte
-}
-
-func (c *tcpTunnelConn) Read(b []byte) (int, error) {
-	if len(c.readBuf) > 0 {
-		n := copy(b, c.readBuf)
-		c.readBuf = c.readBuf[n:]
-		return n, nil
-	}
-
-	for {
-		header := make([]byte, 2)
-		_, err := io.ReadFull(c.reader, header)
-		if err != nil {
-			return 0, err
-		}
-		log.DebugPrint("Received header: ", fmt.Sprintf("%02X %02X", header[0], header[1]))
-		if header[0] == 0x01 && header[1] == 0x00 {
-			lengthBytes := make([]byte, 2)
-			_, err = io.ReadFull(c.reader, lengthBytes)
-			if err != nil {
-				return 0, err
-			}
-			length := binary.BigEndian.Uint16(lengthBytes)
-			data := make([]byte, length)
-			_, err = io.ReadFull(c.reader, data)
-			if err != nil {
-				return 0, err
-			}
-			log.DebugPrint("Received application data, length:", length)
-			log.DebugDumpHex(data)
-
-			n := copy(b, data)
-			if n < len(data) {
-				c.readBuf = data[n:]
-			}
-
-			return n, nil
-		} else if header[0] == 0x01 && header[1] == 0x01 {
-			header = make([]byte, 2)
-			_, err = io.ReadFull(c.reader, header)
-			if err != nil {
-				return 0, err
-			}
-
-			if header[0] == 0x30 && header[1] == 0x30 {
-				log.DebugPrint("Received close message")
-				_ = c.tlsConn.Close()
-				return 0, fmt.Errorf("connection closed by server")
-			}
-		} else if header[0] == 0x53 && header[1] == 0x00 {
-			lengthBytes := make([]byte, 2)
-			_, err = io.ReadFull(c.reader, lengthBytes)
-			if err != nil {
-				return 0, err
-			}
-			length := binary.BigEndian.Uint16(lengthBytes)
-
-			data := make([]byte, length)
-			_, err = io.ReadFull(c.reader, data)
-			if err != nil {
-				return 0, err
-			}
-
-			log.DebugPrint("Received protocol response:")
-			log.DebugDumpHex(data)
-
-			if !strings.Contains(string(data), "OK") {
-				log.Printf("Failed to connect to the server: %s", string(data))
-				_ = c.tlsConn.Close()
-
-				if strings.Contains(string(data), "invalid SID") {
-					panic(err)
-				}
-
-				return 0, fmt.Errorf("failed to connect to the server")
-			}
-		}
-	}
-}
-
-func (c *tcpTunnelConn) Write(b []byte) (int, error) {
-	header := []byte{0x01, 0x00}
-	length := len(b)
-	if length > 0xFFFF {
-		return 0, fmt.Errorf("data too large")
-	}
-	lengthBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(lengthBytes, uint16(length))
-	frame := bytes.Buffer{}
-	frame.Write(header)
-	frame.Write(lengthBytes)
-	frame.Write(b)
-	_, err := c.tlsConn.Write(frame.Bytes())
-	log.DebugDumpHex(frame.Bytes())
-
-	return length, err
-}
-
-func (c *tcpTunnelConn) Close() error {
-	closeMsg := []byte{0x01, 0x01, 0x00, 0x00}
-	_, _ = c.tlsConn.Write(closeMsg)
-	log.DebugPrint("Sent close message")
-	log.DebugDumpHex(closeMsg)
-	return c.tlsConn.Close()
-}
-
-func (c *tcpTunnelConn) LocalAddr() net.Addr {
-	return c.tlsConn.LocalAddr()
-}
-
-func (c *tcpTunnelConn) RemoteAddr() net.Addr {
-	return c.tlsConn.RemoteAddr()
-}
-
-func (c *tcpTunnelConn) SetDeadline(t time.Time) error {
-	return c.tlsConn.SetDeadline(t)
-}
-
-func (c *tcpTunnelConn) SetReadDeadline(t time.Time) error {
-	return c.tlsConn.SetReadDeadline(t)
-}
-
-func (c *tcpTunnelConn) SetWriteDeadline(t time.Time) error {
-	return c.tlsConn.SetWriteDeadline(t)
-}
-
-func randUint64() string {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err)
-	}
-	return fmt.Sprint(binary.BigEndian.Uint64(b[:]))
-}
 
 func calcXRequestSig(key []byte, data []byte) string {
 	h := hmac.New(sha256.New, key)
@@ -273,8 +132,63 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
 	}
 	log.DebugDumpHex(destMsg)
 
-	return &tcpTunnelConn{
-		tlsConn: conn,
-		reader:  bufio.NewReader(conn),
-	}, nil
+	// =====================================================================
+	// 优雅且严谨地读取握手响应，不使用任何缓冲，绝对避免误吞真实业务流量
+	// =====================================================================
+
+	header2 := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header2); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to read handshake response: %w", err)
+	}
+
+	// 1. 如果服务器先返回了 aTrust 专有的身份确认 JSON (05 81 开头)
+	if header2[0] == 0x05 && header2[1] == 0x81 {
+		buf4 := make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf4); err == nil {
+			if buf4[0] == 0x53 && buf4[1] == 0x00 { // 53 00 + 2字节长度
+				msgLen := binary.BigEndian.Uint16(buf4[2:4])
+				jsonData := make([]byte, msgLen)
+				io.ReadFull(conn, jsonData)
+				log.DebugPrint("aTrust Handshake Info: ", string(jsonData))
+			}
+		}
+
+		// 消费完 JSON 后，紧接着读下 2 个字节，此时才迎来真实的 SOCKS5 响应头
+		if _, err := io.ReadFull(conn, header2); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to read SOCKS5 reply: %w", err)
+		}
+	}
+
+	// 2. 此时 header2 必须是标准 SOCKS5 成功响应: 05 00
+	if header2[0] != 0x05 || header2[1] != 0x00 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("SOCKS5 connection rejected, rep code: %x", header2[1])
+	}
+
+	// 3. 读取保留字段 (RSV) 和地址类型 (ATYP)
+	atypBuf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, atypBuf); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to read SOCKS5 ATYP: %w", err)
+	}
+
+	// 4. 根据 ATYP 动态且精准地消耗剩余的数据 (绝不多读 1 个字节)
+	switch atypBuf[1] {
+	case 0x01: // IPv4 (4字节 IP + 2字节 Port)
+		io.ReadFull(conn, make([]byte, 6))
+	case 0x03: // Domain (1字节长度 + 域名 + 2字节 Port)
+		domainLen := make([]byte, 1)
+		io.ReadFull(conn, domainLen)
+		io.ReadFull(conn, make([]byte, int(domainLen[0])+2))
+	case 0x04: // IPv6 (16字节 IP + 2字节 Port)
+		io.ReadFull(conn, make([]byte, 18))
+	default:
+		_ = conn.Close()
+		return nil, fmt.Errorf("unknown SOCKS5 atyp: %x", atypBuf[1])
+	}
+
+	// 握手干净利落地完成，底层的 tls.Conn 就是最完美、无多余封装的净透隧道
+	return conn, nil
 }
