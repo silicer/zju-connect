@@ -127,7 +127,7 @@ func (s *Session) reportEnv() error {
 	return nil
 }
 
-func (s *Session) authCheck() (string, error) {
+func (s *Session) authCheck() (string, bool, error) {
 	log.Println("Perform GET /passport/v1/auth/authCheck")
 
 	u := s.baseURL + "/passport/v1/auth/authCheck"
@@ -138,7 +138,7 @@ func (s *Session) authCheck() (string, error) {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer func(Body io.ReadCloser) {
 		_ = Body.Close()
@@ -151,19 +151,22 @@ func (s *Session) authCheck() (string, error) {
 			NextServiceList []struct {
 				AuthId string `json:"authId"`
 			} `json:"nextServiceList"`
+			NextService string `json:"nextService"`
 		} `json:"data"`
 	}
 	err = json.Unmarshal(body, &ac)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	log.DebugPrintf("Parsed auth check: %+v", ac)
 
+	authID := ""
 	if len(ac.Data.NextServiceList) > 0 {
-		return ac.Data.NextServiceList[0].AuthId, nil
-	} else {
-		return "", nil
+		authID = ac.Data.NextServiceList[0].AuthId
 	}
+
+	needsSms := len(ac.Data.NextServiceList) > 0 || ac.Data.NextService == "auth/sms"
+	return authID, needsSms, nil
 }
 
 func (s *Session) authSms(authId string) error {

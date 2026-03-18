@@ -236,12 +236,12 @@ func (s *Session) Login(username, password, phone, loginDomain, authType, device
 		return "", "", nil, err
 	}
 
-	authID, err := s.authCheck()
+	authID, needsSms, err := s.authCheck()
 	if err != nil {
 		return "", "", nil, err
 	}
 
-	if authID != "" {
+	if needsSms {
 		err = s.authSms(authID)
 		if err != nil {
 			return "", "", nil, err
