@@ -586,7 +586,7 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
 	initHeader := []byte{0x05, 0x01, 0x81, 0x53, 0x03}
 	initMsg := append(initHeader, lenBytes[:]...)
 	initMsg = append(initMsg, msgBytes...)
-	destMsg, err := encodeTCPTunnelDestination(addr.IP, addr.Port, true) // keep campus gateway handshake shape
+	destMsg, err := encodeTCPTunnelDestination(addr.IP, addr.Port, c.tcpTunnelZeroRTT)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -602,11 +602,9 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
 	tunnelConn := &tcpTunnelConn{
 		tlsConn: conn,
 		reader:  bufio.NewReader(conn),
-		// Local campus adaptation: always use raw TCP transfer (no client-side
-		// frames) after the aTrust/SOCKS5 handshake.
-		raw: true,
+		raw:     !c.tcpTunnelZeroRTT,
 	}
-	_, waitErr := waitForTCPConnectReply(ctx, conn, tunnelConn.reader)
+	reuse, waitErr := waitForTCPConnectReply(ctx, conn, tunnelConn.reader)
 	clearDeadlineErr := conn.SetReadDeadline(time.Time{})
 	if waitErr != nil {
 		_ = conn.Close()
@@ -616,5 +614,6 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
 		_ = conn.Close()
 		return nil, fmt.Errorf("failed to clear tcp tunnel handshake timeout: %w", clearDeadlineErr)
 	}
+	tunnelConn.reuse = c.tcpTunnelZeroRTT && reuse
 	return tunnelConn, nil
 }
