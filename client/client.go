@@ -11,33 +11,67 @@ import (
 
 var ErrResourceNotFound = errors.New("resource not found")
 
+type DialContextFunc func(context.Context, string, string) (net.Conn, error)
+
 type IPResource struct {
-	IPMin       net.IP
-	IPMax       net.IP
-	PortMin     int
-	PortMax     int
-	Protocol    string
-	AppID       string
-	NodeGroupID string
+	IPMin           net.IP
+	IPMax           net.IP
+	PortMin         int
+	PortMax         int
+	Protocol        string
+	AppID           string
+	NodeGroupID     string
+	EnableTCPPrefL3 bool
 }
 
 type DomainResource struct {
-	PortMin     int
-	PortMax     int
-	Protocol    string
-	AppID       string
-	NodeGroupID string
+	PortMin         int
+	PortMax         int
+	Protocol        string
+	AppID           string
+	NodeGroupID     string
+	EnableTCPPrefL3 bool
+}
+
+type DomainResources map[string][]DomainResource
+
+func MatchDomainResource(resources []DomainResource, network string, port int) (DomainResource, bool) {
+	return MatchDomainResourceWhere(resources, network, port, nil)
+}
+
+func MatchDomainResourceWhere(resources []DomainResource, network string, port int, accept func(DomainResource) bool) (DomainResource, bool) {
+	for _, resource := range resources {
+		protocolMatches := resource.Protocol == network || resource.Protocol == "all"
+		portMatches := network == "icmp" || resource.PortMin <= port && port <= resource.PortMax
+		if protocolMatches && portMatches && (accept == nil || accept(resource)) {
+			return resource, true
+		}
+	}
+	return DomainResource{}, false
 }
 
 type Client interface {
 	IP() (net.IP, error)
 	IPSet() (*netaddr.IPSet, error)
 	IPResources() ([]IPResource, error)
-	DomainResources() (map[string]DomainResource, error)
-	DNSResource() (map[string]net.IP, error)
+	DomainResources() (DomainResources, error)
+	DNSResource() (map[string][]net.IP, error)
 	DNSServer() (string, error)
+	DNSServers() ([]string, error)
 
 	CanUseTCPTunnel() bool
 	DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, error)
 	NewL3Conn() (io.ReadWriteCloser, error)
+}
+
+type IPUpdateHandlerSetter interface {
+	SetIPUpdateHandler(func(net.IP) error)
+}
+
+func RegisterIPUpdateHandler(c Client, handler func(net.IP) error) bool {
+	setter, ok := c.(IPUpdateHandlerSetter)
+	if ok {
+		setter.SetIPUpdateHandler(handler)
+	}
+	return ok
 }

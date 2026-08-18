@@ -20,6 +20,8 @@ import (
 	"github.com/mythologyli/zju-connect/configs"
 	"github.com/mythologyli/zju-connect/dial"
 	"github.com/mythologyli/zju-connect/internal/hook_func"
+	"github.com/mythologyli/zju-connect/internal/keylog"
+	"github.com/mythologyli/zju-connect/internal/underlay"
 	"github.com/mythologyli/zju-connect/log"
 	"github.com/mythologyli/zju-connect/resolve"
 	"github.com/mythologyli/zju-connect/service"
@@ -36,22 +38,39 @@ var conf configs.Config
 func main() {
 	log.Init()
 
-	if CommitID != "" {
-		log.Println("Start ZJU Connect v" + zjuConnectVersion + "-" + CommitID)
-	} else {
-		log.Println("Start ZJU Connect v" + zjuConnectVersion)
-	}
+	log.Println("Start ZJU Connect " + zjuConnectVersionString())
 	if conf.DebugDump {
 		log.EnableDebug()
 	}
-
 	if errs := hook_func.ExecInitialFunc(context.Background(), conf); errs != nil {
 		for _, err := range errs {
 			log.Printf("Initial ZJU-Connect failed: %s", err)
 		}
 		os.Exit(1)
 	}
-
+	if conf.Protocol != "easyconnect" && conf.Protocol != "atrust" {
+		log.Fatalf("Unsupported VPN protocol: %s", conf.Protocol)
+	}
+	underlayDialer, underlayErr := underlay.New(underlay.Options{
+		InterfaceName:  conf.BindInterface,
+		AutoDetect:     conf.AutoDetectInterface,
+		DebugPCAPFile:  conf.DebugPCAPFile,
+		LocalDNSServer: conf.LocalDNSServer,
+	})
+	if underlayErr != nil {
+		log.Fatalf("Create underlay dialer: %v", underlayErr)
+	}
+	tlsKeyLogWriter, tlsKeyLogErr := keylog.Open(conf.DebugTLSLogFile)
+	if tlsKeyLogErr != nil {
+		_ = underlayDialer.Close()
+		log.Fatalf("Create TLS key log: %v", tlsKeyLogErr)
+	}
+	if conf.DebugPCAPFile != "" {
+		log.Printf("VPN underlay PCAP capture enabled: %s", conf.DebugPCAPFile)
+	}
+	if conf.DebugTLSLogFile != "" {
+		log.Printf("TLS key logging enabled: %s", conf.DebugTLSLogFile)
+	}
 	var vpnClient client.Client
 	switch conf.Protocol {
 	case "easyconnect":
@@ -84,11 +103,18 @@ func main() {
 			!conf.DisableMultiLine,
 			!conf.DisableServerConfig,
 			!conf.SkipDomainResource,
+			underlayDialer,
+			tlsKeyLogWriter,
 		)
 
 		log.Printf("VPN protocol: %s", conf.Protocol)
 		err := vpnClient.(*easyconnectclient.Client).Setup(conf.GraphCodeFile)
 		if err != nil {
+			vpnClient.(*easyconnectclient.Client).Close()
+			_ = underlayDialer.Close()
+			if tlsKeyLogWriter != nil {
+				_ = tlsKeyLogWriter.Close()
+			}
 			log.Fatalf("VPN client setup error: %s", err)
 		}
 	case "atrust":
@@ -111,7 +137,7 @@ func main() {
 			}
 		}
 
-		vpnClient = atrustclient.NewClient(conf.Username, conf.SID, conf.DeviceID, conf.SignKey)
+		vpnClient = atrustclient.NewClient(conf.Username, conf.SID, conf.DeviceID, conf.SignKey, underlayDialer, tlsKeyLogWriter)
 
 		log.Printf("VPN protocol: %s", conf.Protocol)
 		clientData, err = vpnClient.(*atrustclient.Client).Setup(
@@ -124,11 +150,18 @@ func main() {
 			conf.AuthType,
 			conf.GraphCodeFile,
 			conf.CasTicket,
+			conf.OAuth2Code,
+			conf.TOTPSecret,
 			clientData,
 			resourceData,
 			conf.UpdateBestNodesInterval,
 		)
 		if err != nil {
+			vpnClient.(*atrustclient.Client).Close()
+			_ = underlayDialer.Close()
+			if tlsKeyLogWriter != nil {
+				_ = tlsKeyLogWriter.Close()
+			}
 			log.Fatalf("VPN client setup error: %s", err)
 		}
 
@@ -139,11 +172,23 @@ func main() {
 			}
 			log.Printf("Client data saved to %s", conf.ClientDataFile)
 		}
-	default:
-		log.Fatalf("Unsupported VPN protocol: %s", conf.Protocol)
 	}
 
 	log.Printf("VPN client started")
+	if closer, ok := vpnClient.(interface{ Close() }); ok {
+		hook_func.RegisterTerminalFunc("CloseVPNClient", func(ctx context.Context) error {
+			closer.Close()
+			return nil
+		})
+	}
+	hook_func.RegisterTerminalFunc("CloseUnderlayDialer", func(ctx context.Context) error {
+		return underlayDialer.Close()
+	})
+	if tlsKeyLogWriter != nil {
+		hook_func.RegisterTerminalFunc("CloseTLSKeyLog", func(ctx context.Context) error {
+			return tlsKeyLogWriter.Close()
+		})
+	}
 
 	ipResources, err := vpnClient.IPResources()
 	if err != nil && !conf.DisableServerConfig {
@@ -168,14 +213,14 @@ func main() {
 	if conf.Protocol == "easyconnect" {
 		if !conf.DisableZJUConfig {
 			if domainResources == nil {
-				domainResources = make(map[string]client.DomainResource)
+				domainResources = make(client.DomainResources)
 			}
 
-			domainResources["zju.edu.cn"] = client.DomainResource{
+			domainResources["zju.edu.cn"] = []client.DomainResource{{
 				PortMin:  1,
 				PortMax:  65535,
 				Protocol: "all",
-			}
+			}}
 
 			if ipResources == nil {
 				ipResources = []client.IPResource{}
@@ -199,18 +244,18 @@ func main() {
 
 		for _, customProxyDomain := range conf.CustomProxyDomain {
 			if domainResources != nil {
-				domainResources[customProxyDomain] = client.DomainResource{
+				domainResources[customProxyDomain] = append(domainResources[customProxyDomain], client.DomainResource{
 					PortMin:  1,
 					PortMax:  65535,
 					Protocol: "all",
-				}
+				})
 			} else {
-				domainResources = map[string]client.DomainResource{
-					customProxyDomain: {
+				domainResources = client.DomainResources{
+					customProxyDomain: {{
 						PortMin:  1,
 						PortMax:  65535,
 						Protocol: "all",
-					},
+					}},
 				}
 			}
 		}
@@ -252,6 +297,7 @@ func main() {
 
 	useRemoteDNS := !conf.DisableRemoteDNS
 	remoteDNSServer := conf.RemoteDNSServer
+	policyDNSServers, _ := vpnClient.DNSServers()
 	if useRemoteDNS && remoteDNSServer == "auto" {
 		remoteDNSServer, err = vpnClient.DNSServer()
 		if err != nil {
@@ -262,16 +308,28 @@ func main() {
 			log.Printf("Use DNS server %s provided by server", remoteDNSServer)
 		}
 	}
+	secondaryDNSServer := conf.SecondaryDNSServer
+	if secondaryDNSServer == "auto" {
+		secondaryDNSServer = "114.114.114.114"
+		if len(policyDNSServers) > 1 {
+			secondaryDNSServer = policyDNSServers[1]
+			log.Printf("Use secondary DNS server %s provided by server", secondaryDNSServer)
+		}
+	}
 
 	vpnResolver := resolve.NewResolver(
 		vpnStack,
 		remoteDNSServer,
-		conf.SecondaryDNSServer,
+		secondaryDNSServer,
 		conf.DNSTTL,
 		domainResources,
 		dnsResource,
 		useRemoteDNS,
 	)
+	hook_func.RegisterTerminalFunc("CloseResolver", func(ctx context.Context) error {
+		vpnResolver.Close()
+		return nil
+	})
 
 	for _, customDns := range conf.CustomDNSList {
 		ipAddr := net.ParseIP(customDns.IP)
@@ -313,11 +371,12 @@ func main() {
 	}
 
 	for _, portForwarding := range conf.PortForwardingList {
-		if portForwarding.NetworkType == "tcp" {
+		switch portForwarding.NetworkType {
+		case "tcp":
 			go service.ServeTCPForwarding(vpnStack, portForwarding.BindAddress, portForwarding.RemoteAddress)
-		} else if portForwarding.NetworkType == "udp" {
+		case "udp":
 			go service.ServeUDPForwarding(vpnStack, portForwarding.BindAddress, portForwarding.RemoteAddress)
-		} else {
+		default:
 			log.Printf("Port forwarding: unknown network type %s. Aborting", portForwarding.NetworkType)
 		}
 	}
@@ -326,7 +385,12 @@ func main() {
 		if conf.KeepAliveURL == "" && !useRemoteDNS {
 			log.Println("Keep alive is disabled because remote DNS is disabled, and no KeepAliveURL is provided")
 		} else {
-			go service.KeepAlive(vpnResolver, vpnDialer, conf.KeepAliveURL)
+			keepAliveCtx, keepAliveCancel := context.WithCancel(context.Background())
+			hook_func.RegisterTerminalFunc("CloseKeepAlive", func(ctx context.Context) error {
+				keepAliveCancel()
+				return nil
+			})
+			go service.KeepAlive(keepAliveCtx, vpnResolver, vpnDialer, conf.KeepAliveURL)
 		}
 	}
 
@@ -336,7 +400,7 @@ func main() {
 		winquit.SimulateSigTermOnQuit(done)
 		<-done
 	} else {
-		quit := make(chan os.Signal)
+		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 		<-quit
 	}

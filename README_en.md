@@ -141,15 +141,25 @@
 
 + `zju-dns-server`: Remote DNS server address, default is `auto`. Set to `auto` to use the DNS server obtained from the server; disable remote DNS if it fails to obtain
 
-+ `secondary-dns-server`: Standby DNS server used when the remote DNS server cannot resolve, default is `114.114.114.114`. Leave blank to use system default DNS, but must be set when `dns-hijack` is enabled
++ `secondary-dns-server`: Standby DNS server used when the remote DNS server cannot resolve. The default `auto` uses the second server supplied by VPN policy, then falls back to `114.114.114.114`. Leave blank to use system default DNS, but it must be set when `dns-hijack` is enabled
 
 + `dns-server-bind`: DNS server listening address, default is empty (disabled). For example, set to `127.0.0.1:53`, then you can send DNS requests to `127.0.0.1:53`
+
++ `local-dns-server`: Local DNS server used to resolve the VPN server hostname, as IP or IP:port; when empty, the system DNS is used, routable DNS addresses are bound to the detected underlay interface, and local DNS stubs keep their loopback route
 
 + `dns-hijack`: Hijack DNS requests when TUN mode is enabled, it's recommended to add this argument when using TUN mode
 
 + `fake-ip`: Enable Fake IP mode. Works with dns-hijack. Don't enable it if you are using EasyConnect protocol
 
 + `debug-dump`: Whether to enable debugging, generally no need to add this argument
+
++ `debug-pcap-file`: Reconstruct a PCAP from data read and written on VPN underlay TCP connections; a full capture queue blocks network I/O, kernel handshakes and retransmissions are omitted, and TLS payloads remain encrypted
+
++ `debug-tls-log-file`: Export TLS session secrets in NSS key log format for decrypting `debug-pcap-file` traffic in Wireshark. The file contains session secrets and must only be used for debugging and stored securely
+
++ `bind-interface`: Manually bind VPN underlay connections to this network interface for either EasyConnect or aTrust. A non-empty value takes precedence over automatic detection.
+
++ `auto-detect-interface`: Automatically detect and bind the VPN underlay interface; defaults to `false`. Set it to `true` to enable automatic detection. If disabled and `bind-interface` is empty, underlay connections use system routing. **This feature may not work correctly while another VPN with Fake IP enabled is in use.**
 
 + `tcp-port-forwarding`: TCP port forwarding, format is `local address-remote address,local address-remote address,...`, for example `127.0.0.1:9898-10.10.98.98:80,0.0.0.0:9899-10.10.98.98:80`. Multiple forwardings are separated by `,`
 
@@ -181,13 +191,15 @@
 
 #### aTrust Related Arguments
 
-+ `auth-type`: aTrust login authentication type, supports `auth/psw` (password), `auth/cas` (CAS), `auth/smsCheckCode` (SMS verification code), default is `auth/psw`.
++ `auth-type`: aTrust login authentication type, supports `auth/psw` (password), `auth/cas` (CAS), `auth/smsCheckCode` (SMS verification code), default is empty (try to skip auth).
 + `login-domain`: Login domain, default is `Radius`.
 + `client-data-file`: Client data file path, used to save login status to avoid repeated verification.
 + `cas-ticket`: CAS verification ticket, defaults to empty, which triggers interactive verification.
 + `phone`: Phone number used for SMS verification code login.
 + `update-best-nodes-interval`: Interval for updating the optimal line automatically, in seconds, default is `300`. Set to `0` to disable automatic optimal line selection.
 + `auth-info`: Only get aTrust authentication information without logging in, generally no need to add this argument. Can be used to check supported authentication methods.
++ `trust-device`: Trust the current device (requires logged-in `-client-data-file`), does not start the tunnel.
++ `untrust-device`: Untrust the current device (requires logged-in `-client-data-file`), does not start the tunnel.
 + `sid`: aTrust SID, for debugging purposes, generally no need to add this argument.
 + `device-id`: aTrust device ID, for debugging purposes, generally no need to add this argument.
 + `sign-key`: aTrust signature key, for debugging purposes, generally no need to add this argument.

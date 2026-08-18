@@ -2,16 +2,18 @@ package easyconnect
 
 import (
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/mythologyli/zju-connect/client"
 	"github.com/mythologyli/zju-connect/internal/ping"
 )
 
 const pingNum = 3
 
-func findBestLine(lineList []string) (string, error) {
+func findBestLine(lineList []string, dialContext client.DialContextFunc, keyLogWriter io.Writer) (string, error) {
 	bestLine := ""
 	bestLatency := int64(0)
 
@@ -27,6 +29,8 @@ func findBestLine(lineList []string) (string, error) {
 		}
 
 		tcping := ping.NewTCPing()
+		tcping.SetDialContext(dialContext)
+		tcping.SetKeyLogWriter(keyLogWriter)
 		target := ping.Target{
 			Protocol: ping.TCP,
 			Host:     host,

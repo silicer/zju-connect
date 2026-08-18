@@ -1,13 +1,14 @@
 package atrust
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 
 	"github.com/mythologyli/zju-connect/client"
+	"github.com/mythologyli/zju-connect/internal/ipresource"
 	"github.com/mythologyli/zju-connect/internal/zctcpip"
 	"github.com/mythologyli/zju-connect/log"
 )
@@ -28,24 +29,21 @@ func (t *L3Tunnel) processIPV4(packet zctcpip.IPv4Packet) error {
 		return fmt.Errorf("protocol %d: %w", packet.Protocol(), client.ErrResourceNotFound)
 	}
 
-	for _, resource := range t.ipResources {
-		if bytes.Compare(packet.DestinationIP(), resource.IPMin) >= 0 && bytes.Compare(packet.DestinationIP(), resource.IPMax) <= 0 {
-			if resource.Protocol == protocol || resource.Protocol == "all" {
-				if protocol == "icmp" {
-					return t.writePacket(packet, resource.AppID, resource.NodeGroupID)
-				}
-
-				if resource.PortMin <= port && port <= resource.PortMax {
-					return t.writePacket(packet, resource.AppID, resource.NodeGroupID)
-				}
-			}
-		}
+	resource, ok := matchL3IPResource(t.resourceIndex, packet.DestinationIP(), protocol, port)
+	if ok {
+		return t.writePacket(packet, resource.AppID, resource.NodeGroupID)
 	}
 
 	if port != -1 {
 		return fmt.Errorf("%s:%d, [%s]: %w", packet.DestinationIP(), port, protocol, client.ErrResourceNotFound)
 	}
 	return fmt.Errorf("%s, [%s]: %w", packet.DestinationIP(), protocol, client.ErrResourceNotFound)
+}
+
+func matchL3IPResource(index *ipresource.Index, destination net.IP, protocol string, port int) (client.IPResource, bool) {
+	return index.MatchWhere(destination, protocol, port, func(resource client.IPResource) bool {
+		return protocol != "tcp" || resource.EnableTCPPrefL3
+	})
 }
 
 func (t *L3Tunnel) writePacket(packet zctcpip.IPv4Packet, appID, nodeGroupID string) error {
@@ -57,21 +55,40 @@ func (t *L3Tunnel) writePacket(packet zctcpip.IPv4Packet, appID, nodeGroupID str
 
 	conn, err := t.getConn(nodeGroupID)
 	if err != nil {
+		if isClosedConnErr(err) {
+			log.Printf("Drop packet while l3-tunnel reconnects after connection failure: %v", err)
+			return nil
+		}
 		return err
 	}
 	log.DebugPrintf("l3-tunnel send packet appID=%s group=%s len=%d", appID, nodeGroupID, len(packet))
 	logPacket("send", packet)
 	err = conn.WritePacket(meta, appID, nodeGroupID, packet)
-	for retry := 0; retry < 5 && isClosedConnErr(err); retry++ {
+	for retry := 0; retry < 1 && isClosedConnErr(err); retry++ {
 		// If the cached tunnel conn was closed by network flaps, evict it and retry.
-		log.Println("Write packet failed with closed connection, evicting conn and retrying...")
+		log.Printf("Write packet failed with closed connection, evicting conn and retrying: %v", err)
 		t.evictConn(nodeGroupID, conn)
+		t.startReconnect(nodeGroupID)
 		retryConn, retryErr := t.getConn(nodeGroupID)
 		if retryErr != nil {
+			if isClosedConnErr(retryErr) {
+				err = retryErr
+				continue
+			}
 			return retryErr
 		}
 		conn = retryConn
 		err = conn.WritePacket(meta, appID, nodeGroupID, packet)
+	}
+	if isAuthTimeoutErr(err) {
+		log.Printf("Drop packet after conntrack authentication timed out: %v", err)
+		return nil
+	}
+	if isClosedConnErr(err) {
+		log.Printf("Drop packet while l3-tunnel reconnect remains unavailable: %v", err)
+		t.evictConn(nodeGroupID, conn)
+		t.startReconnect(nodeGroupID)
+		return nil
 	}
 	return err
 }
@@ -83,7 +100,14 @@ func isClosedConnErr(err error) bool {
 	if errors.Is(err, net.ErrClosed) {
 		return true
 	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
 	return strings.Contains(err.Error(), "use of closed network connection")
+}
+
+func isAuthTimeoutErr(err error) bool {
+	return errors.Is(err, errL3TunnelAuthTimeout)
 }
 
 func buildPacketMeta(packet zctcpip.IPv4Packet) (packetMeta, error) {
@@ -123,6 +147,9 @@ func buildPacketMeta(packet zctcpip.IPv4Packet) (packetMeta, error) {
 }
 
 func logPacket(direction string, packet []byte) {
+	if !log.DebugEnabled() {
+		return
+	}
 	if len(packet) == 0 {
 		log.DebugPrintf("l3-tunnel %s packet len=0", direction)
 		return

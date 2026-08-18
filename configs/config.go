@@ -3,34 +3,39 @@ package configs
 type (
 	Config struct {
 		// Common fields
-		Protocol           string // "easyconnect" or "atrust"
-		ServerAddress      string
-		ServerPort         int
-		Username           string
-		Password           string
-		SocksBind          string
-		SocksUser          string
-		SocksPasswd        string
-		HTTPBind           string
-		PortForwardingList []SinglePortForwarding
-		ShadowsocksURL     string
-		DialDirectProxy    string
-		DisableZJUConfig   bool
-		DisableRemoteDNS   bool
-		DNSTTL             uint64
-		RemoteDNSServer    string
-		SecondaryDNSServer string
-		DNSServerBind      string
-		CustomDNSList      []SingleCustomDNS
-		DisableKeepAlive   bool
-		KeepAliveURL       string
-		TCPTunnelMode      bool
-		TUNMode            bool
-		AddRoute           bool
-		DNSHijack          bool
-		FakeIP             bool
-		GraphCodeFile      string
-		DebugDump          bool
+		Protocol            string // "easyconnect" or "atrust"
+		ServerAddress       string
+		ServerPort          int
+		Username            string
+		Password            string
+		SocksBind           string
+		SocksUser           string
+		SocksPasswd         string
+		HTTPBind            string
+		PortForwardingList  []SinglePortForwarding
+		ShadowsocksURL      string
+		DialDirectProxy     string
+		DisableZJUConfig    bool
+		DisableRemoteDNS    bool
+		DNSTTL              uint64
+		RemoteDNSServer     string
+		SecondaryDNSServer  string
+		DNSServerBind       string
+		LocalDNSServer      string
+		CustomDNSList       []SingleCustomDNS
+		DisableKeepAlive    bool
+		KeepAliveURL        string
+		TCPTunnelMode       bool
+		TUNMode             bool
+		AddRoute            bool
+		DNSHijack           bool
+		FakeIP              bool
+		GraphCodeFile       string
+		DebugDump           bool
+		DebugPCAPFile       string
+		DebugTLSLogFile     string
+		BindInterface       string
+		AutoDetectInterface bool
 
 		// EasyConnect fields
 		TOTPSecret          string
@@ -49,6 +54,7 @@ type (
 		LoginDomain             string
 		ClientDataFile          string
 		CasTicket               string
+		OAuth2Code              string
 		SID                     string
 		DeviceID                string
 		SignKey                 string
@@ -99,10 +105,13 @@ type (
 		RemoteDNSServer         *string                    `toml:"zju_dns_server"` // TODO: rename to remote_dns_server
 		SecondaryDNSServer      *string                    `toml:"secondary_dns_server"`
 		DNSServerBind           *string                    `toml:"dns_server_bind"`
+		LocalDNSServer          *string                    `toml:"local_dns_server"`
 		DNSHijack               *bool                      `toml:"dns_hijack"`
 		FakeIP                  *bool                      `toml:"fake_ip"`
 		GraphCodeFile           *string                    `toml:"graph_code_file"`
 		DebugDump               *bool                      `toml:"debug_dump"`
+		DebugPCAPFile           *string                    `toml:"debug_pcap_file"`
+		DebugTLSLogFile         *string                    `toml:"debug_tls_log_file"`
 		PortForwarding          []SinglePortForwardingTOML `toml:"port_forwarding"`
 		CustomDNS               []SingleCustomDNSTOML      `toml:"custom_dns"`
 		CustomProxyDomain       []string                   `toml:"custom_proxy_domain"`
@@ -111,11 +120,14 @@ type (
 		LoginDomain             *string                    `toml:"login_domain"`
 		ClientDataFile          *string                    `toml:"client_data_file"`
 		CasTicket               *string                    `toml:"cas_ticket"`
+		OAuth2Code              *string                    `toml:"oauth2_code"`
 		SID                     *string                    `toml:"sid"`
 		DeviceID                *string                    `toml:"device_id"`
 		SignKey                 *string                    `toml:"sign_key"`
 		ResourceFile            *string                    `toml:"resource_file"`
 		UpdateBestNodesInterval *int                       `toml:"update_best_nodes_interval"`
+		BindInterface           *string                    `toml:"bind_interface"`
+		AutoDetectInterface     *bool                      `toml:"auto_detect_interface"`
 	}
 
 	SinglePortForwardingTOML struct {

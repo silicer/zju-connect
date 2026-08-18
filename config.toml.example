@@ -1,4 +1,4 @@
-protocol = "easyconnect" # "easyconnect" or "anyconnect"
+protocol = "easyconnect" # "easyconnect" or "atrust"
 server_address = "rvpn.zju.edu.cn"
 server_port = 443
 username = "username"
@@ -18,11 +18,16 @@ dns_ttl = 3600
 disable_keep_alive = false
 keep_alive_url = "" # "https://www.cnki.net/favicon.ico"
 zju_dns_server = "auto"
-secondary_dns_server = "114.114.114.114"
+secondary_dns_server = "auto"
 dns_server_bind = ""
+local_dns_server = "" # DNS used to resolve the VPN server, e.g. "223.5.5.5" or "223.5.5.5:53"
 dns_hijack = false
 fake_ip = false
 debug_dump = false
+debug_pcap_file = "" # Reconstruct encrypted VPN underlay TCP traffic in this PCAP file (debug only)
+debug_tls_log_file = "" # Export TLS session secrets in NSS key log format (debug only)
+bind_interface = ""
+auto_detect_interface = false
 
 # Port forwarding
 port_forwarding = [
@@ -57,6 +62,7 @@ login_domain = "Radius"
 client_data_file = "client_data.json"
 graph_code_file = "" # Optional: captcha image will open in browser if this left empty. If set, the program will save the captcha image to this file and ask user to input the code in terminal.
 cas_ticket = ""
+oauth2_code = ""
 phone = ""
 update_best_nodes_interval = 300
 sid = ""

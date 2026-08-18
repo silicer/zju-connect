@@ -2,7 +2,7 @@ name: Build
 
 on:
   release:
-    types: [ published ]
+    types: [published]
   push:
     paths:
       - "**/*.go"
@@ -24,8 +24,8 @@ jobs:
     strategy:
       matrix:
         # Include amd64 on all platforms.
-        goos: [ windows, linux, darwin ]
-        goarch: [ amd64, 386 ]
+        goos: [windows, linux, darwin]
+        goarch: [amd64, 386]
         exclude:
           # Exclude i386 on darwin.
           - goarch: 386
@@ -36,9 +36,6 @@ jobs:
           - { goos: linux, goarch: arm, goarm: 6 }
           - { goos: linux, goarch: arm, goarm: 5 }
           # END Linux ARM 5 6 7
-          # BEGIN Windows ARM 7
-          - { goos: windows, goarch: arm, goarm: 7 }
-          # END Windows ARM 7
           # BEGIN Other architectures
           - { goos: darwin, goarch: arm64 }
           - { goos: linux, goarch: arm64 }
@@ -81,13 +78,17 @@ jobs:
         run: go mod download
 
       - name: Build
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           mkdir -p build_assets
           SHORT_SHA=$(git rev-parse --short HEAD)
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            VERSION_FLAGS=""
+          VERSION=dev
+          VERSION_FLAGS="-X main.zjuConnectVersion=${VERSION}"
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION_FLAGS="-X main.zjuConnectVersion=${RELEASE_TAG}"
           else
-            VERSION_FLAGS="-X 'main.CommitID=${SHORT_SHA}'"
+            VERSION_FLAGS="${VERSION_FLAGS} -X main.CommitID=${SHORT_SHA}"
           fi
           go build -v -o build_assets/zju-connect -trimpath \
             -ldflags "-s -w -buildid= ${VERSION_FLAGS}" .
@@ -118,6 +119,70 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           gh release upload --clobber ${{ github.event_name == 'release' && github.event.release.tag_name || 'nightly' }} zju-connect-${{ steps.get_filename.outputs.ASSET_NAME }}.zip
+
+  update-aur:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Update AUR package
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${AUR_SSH_PRIVATE_KEY}" ]; then
+            echo "::error::AUR_SSH_PRIVATE_KEY is not set"
+            exit 1
+          fi
+
+          TAG="${{ github.event.release.tag_name }}"
+          PKGVER="${TAG#v}"
+          PKGVER="${PKGVER//-/_}"
+
+          eval "$(ssh-agent -s)"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" | tr -d '\r' | ssh-add -
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+          git clone ssh://aur@aur.archlinux.org/zju-connect-bin.git aur-package
+          cd aur-package
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          OLD_PKGVER="$(grep -E '^pkgver=' PKGBUILD | cut -d= -f2-)"
+          OLD_PKGREL="$(grep -E '^pkgrel=' PKGBUILD | cut -d= -f2-)"
+          if [ "${OLD_PKGVER}" = "${PKGVER}" ]; then
+            PKGREL="$((OLD_PKGREL + 1))"
+          else
+            PKGREL=1
+          fi
+
+          sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=${PKGREL}/" PKGBUILD
+
+          docker run --rm -i -v "$PWD:/pkg" -w /pkg archlinux:base-devel bash <<'EOF'
+          set -euo pipefail
+          pkg_owner="$(stat -c '%u:%g' /pkg)"
+          trap 'chown -R "$pkg_owner" /pkg' EXIT
+          pacman -Sy --noconfirm pacman-contrib
+          useradd -m builder
+          chown -R builder:builder /pkg
+          su builder -c 'cd /pkg && updpkgsums && makepkg --printsrcinfo > .SRCINFO'
+          EOF
+
+          git diff --check
+          if git diff --quiet; then
+            echo "AUR package is already up to date."
+            exit 0
+          fi
+
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${TAG}"
+          git push
 
   nightly:
     if: github.event_name != 'release' && github.event_name == 'push' && contains(vars.NIGHTLY_RELEASE_ENABLED_BRANCHES, github.ref_name)

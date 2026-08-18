@@ -1,10 +1,14 @@
 package ping
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
+	"github.com/mythologyli/zju-connect/client"
 	"github.com/mythologyli/zju-connect/log"
 )
 
@@ -13,6 +17,18 @@ type TCPing struct {
 	target *Target
 	done   chan struct{}
 	result *Result
+	dial   client.DialContextFunc
+	keyLog io.Writer
+}
+
+// SetDialContext overrides the system dialer used by TCPing.
+func (tcping *TCPing) SetDialContext(dial client.DialContextFunc) {
+	tcping.dial = dial
+}
+
+// SetKeyLogWriter records probe TLS secrets in NSS key log format.
+func (tcping *TCPing) SetKeyLogWriter(writer io.Writer) {
+	tcping.keyLog = writer
 }
 
 var _ Pinger = (*TCPing)(nil)
@@ -88,12 +104,29 @@ func (tcping *TCPing) Stop() {
 func (tcping TCPing) ping() (time.Duration, net.Addr, error) {
 	var remoteAddr net.Addr
 	duration, errIfce := timeIt(func() interface{} {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", tcping.target.Host, tcping.target.Port), tcping.target.Timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), tcping.target.Timeout)
+		defer cancel()
+		dial := (&net.Dialer{}).DialContext
+		if tcping.dial != nil {
+			dial = tcping.dial
+		}
+		conn, err := dial(ctx, "tcp", fmt.Sprintf("%s:%d", tcping.target.Host, tcping.target.Port))
 		if err != nil {
 			return err
 		}
 		remoteAddr = conn.RemoteAddr()
-		conn.Close()
+		defer conn.Close()
+
+		tlsConn := tls.Client(conn, &tls.Config{
+			ServerName:         tcping.target.Host,
+			InsecureSkipVerify: true,
+			KeyLogWriter:       tcping.keyLog,
+		})
+		err = tlsConn.HandshakeContext(ctx)
+		tlsConn.Close()
+		if err != nil {
+			return err
+		}
 		return nil
 	})
 	if errIfce != nil {

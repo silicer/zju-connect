@@ -16,9 +16,17 @@ import (
 	"github.com/mythologyli/zju-connect/configs"
 )
 
-var CommitID string
+var (
+	zjuConnectVersion = "dev"
+	CommitID          string
+)
 
-const zjuConnectVersion = "1.0.0"
+func zjuConnectVersionString() string {
+	if CommitID != "" {
+		return zjuConnectVersion + "-" + CommitID
+	}
+	return zjuConnectVersion
+}
 
 func getTOMLVal[T int | uint64 | string | bool](valPointer *T, defaultVal T) T {
 	if valPointer == nil {
@@ -61,19 +69,25 @@ func parseTOMLConfig(configFile string, conf *configs.Config) error {
 	conf.AddRoute = getTOMLVal(confTOML.AddRoute, false)
 	conf.DNSTTL = getTOMLVal(confTOML.DNSTTL, uint64(3600))
 	conf.DebugDump = getTOMLVal(confTOML.DebugDump, false)
+	conf.DebugPCAPFile = getTOMLVal(confTOML.DebugPCAPFile, "")
+	conf.DebugTLSLogFile = getTOMLVal(confTOML.DebugTLSLogFile, "")
 	conf.DisableKeepAlive = getTOMLVal(confTOML.DisableKeepAlive, false)
 	conf.KeepAliveURL = getTOMLVal(confTOML.KeepAliveURL, "")
 	conf.RemoteDNSServer = getTOMLVal(confTOML.RemoteDNSServer, "auto")
-	conf.SecondaryDNSServer = getTOMLVal(confTOML.SecondaryDNSServer, "114.114.114.114")
+	conf.SecondaryDNSServer = getTOMLVal(confTOML.SecondaryDNSServer, "auto")
 	conf.DNSServerBind = getTOMLVal(confTOML.DNSServerBind, "")
+	conf.LocalDNSServer = getTOMLVal(confTOML.LocalDNSServer, "")
 	conf.DNSHijack = getTOMLVal(confTOML.DNSHijack, false)
 	conf.FakeIP = getTOMLVal(confTOML.FakeIP, false)
 	conf.GraphCodeFile = getTOMLVal(confTOML.GraphCodeFile, "")
-	conf.AuthType = getTOMLVal(confTOML.AuthType, "auth/psw")
+	conf.BindInterface = getTOMLVal(confTOML.BindInterface, "")
+	conf.AutoDetectInterface = getTOMLVal(confTOML.AutoDetectInterface, false)
+	conf.AuthType = getTOMLVal(confTOML.AuthType, "")
 	conf.Phone = getTOMLVal(confTOML.Phone, "")
 	conf.LoginDomain = getTOMLVal(confTOML.LoginDomain, "Radius")
 	conf.ClientDataFile = getTOMLVal(confTOML.ClientDataFile, "")
 	conf.CasTicket = getTOMLVal(confTOML.CasTicket, "")
+	conf.OAuth2Code = getTOMLVal(confTOML.OAuth2Code, "")
 	conf.SID = getTOMLVal(confTOML.SID, "")
 	conf.DeviceID = getTOMLVal(confTOML.DeviceID, "")
 	conf.SignKey = getTOMLVal(confTOML.SignKey, "")
@@ -120,7 +134,7 @@ func parseTOMLConfig(configFile string, conf *configs.Config) error {
 		var domainRegex = regexp.MustCompile(`^[a-zA-Z\d-]+(\.[a-zA-Z\d-]+)*\.[a-zA-Z]{2,}$`)
 		if !domainRegex.MatchString(singleCustomProxyDomain) {
 			fmt.Printf("ZJU Connect: %s is not a valid domain\n", singleCustomProxyDomain)
-			return errors.New(fmt.Sprintf("ZJU Connect: %s is not a valid domain", singleCustomProxyDomain))
+			return fmt.Errorf("ZJU Connect: %s is not a valid domain", singleCustomProxyDomain)
 		}
 		conf.CustomProxyDomain = append(conf.CustomProxyDomain, singleCustomProxyDomain)
 	}
@@ -132,6 +146,8 @@ func init() {
 	configFile, tcpPortForwarding, udpPortForwarding, customDns, customProxyDomain := "", "", "", "", ""
 	showVersion := false
 	atrustAuthInfo := false
+	atrustTrustDevice := false
+	atrustUntrustDevice := false
 
 	flag.StringVar(&conf.Protocol, "protocol", "easyconnect", "Protocol (easyconnect, atrust)")
 	flag.StringVar(&conf.ServerAddress, "server", "rvpn.zju.edu.cn", "EasyConnect/aTrust server address")
@@ -158,20 +174,26 @@ func init() {
 	flag.BoolVar(&conf.AddRoute, "add-route", false, "Add route from rules for TUN interface")
 	flag.Uint64Var(&conf.DNSTTL, "dns-ttl", 3600, "DNS record time to live, unit is second")
 	flag.BoolVar(&conf.DebugDump, "debug-dump", false, "Enable traffic debug dump (only for debug usage)")
+	flag.StringVar(&conf.DebugPCAPFile, "debug-pcap-file", "", "Save reconstructed VPN underlay TCP traffic to a PCAP file (debug only)")
+	flag.StringVar(&conf.DebugTLSLogFile, "debug-tls-log-file", "", "Save TLS session secrets in NSS key log format (debug only)")
 	flag.BoolVar(&conf.DisableKeepAlive, "disable-keep-alive", false, "Disable keep alive")
 	flag.StringVar(&conf.KeepAliveURL, "keep-alive-url", "", "Keep alive URL, default is empty (use DNS keep alive)")
 	flag.StringVar(&conf.RemoteDNSServer, "zju-dns-server", "auto", "Remote DNS server address. Set to 'auto' to use remote DNS server provided by server") // TODO: rename to remote-dns-server
-	flag.StringVar(&conf.SecondaryDNSServer, "secondary-dns-server", "114.114.114.114", "Secondary DNS server address. Leave empty to use system default DNS server")
+	flag.StringVar(&conf.SecondaryDNSServer, "secondary-dns-server", "auto", "Secondary DNS server address. Use auto for the server policy value")
 	flag.StringVar(&conf.DNSServerBind, "dns-server-bind", "", "The address DNS server listens on (e.g. 127.0.0.1:53)")
+	flag.StringVar(&conf.LocalDNSServer, "local-dns-server", "", "DNS server used to resolve the VPN server hostname (IP or IP:port)")
 	flag.BoolVar(&conf.DNSHijack, "dns-hijack", false, "Hijack all dns query to ZJU Connect. False by default.")
 	flag.BoolVar(&conf.FakeIP, "fake-ip", false, "Enable Fake IP for DNS hijack")
 	flag.StringVar(&conf.GraphCodeFile, "graph-code-file", "", "Graph Check Code File")
+	flag.StringVar(&conf.BindInterface, "bind-interface", "", "Bind VPN underlay connections to this network interface (takes precedence over auto detection)")
+	flag.BoolVar(&conf.AutoDetectInterface, "auto-detect-interface", false, "Automatically detect and bind the VPN underlay interface")
 	flag.StringVar(&conf.TwfID, "twf-id", "", "Login using twfID captured (mostly for debug usage)")
-	flag.StringVar(&conf.AuthType, "auth-type", "auth/psw", "aTrust authentication type (auth/psw, auth/cas, auth/smsCheckCode)")
+	flag.StringVar(&conf.AuthType, "auth-type", "", "aTrust authentication type (auth/psw, auth/cas, auth/httpsOauth2, auth/smsCheckCode)")
 	flag.StringVar(&conf.Phone, "phone", "", "Phone number with country code for aTrust SMS check code login (e.g. 852-114514)")
 	flag.StringVar(&conf.LoginDomain, "login-domain", "Radius", "aTrust login domain")
 	flag.StringVar(&conf.ClientDataFile, "client-data-file", "", "aTrust Client Data File")
 	flag.StringVar(&conf.CasTicket, "cas-ticket", "", "aTrust CAS Ticket (optional, interactive mode if not set)")
+	flag.StringVar(&conf.OAuth2Code, "oauth2-code", "", "aTrust OAuth2 code (optional, interactive mode if not set)")
 	flag.StringVar(&conf.SID, "sid", "", "aTrust SID (mostly for debug usage)")
 	flag.StringVar(&conf.DeviceID, "device-id", "", "aTrust Device ID (mostly for debug usage)")
 	flag.StringVar(&conf.SignKey, "sign-key", "", "aTrust Sign Key (mostly for debug usage)")
@@ -184,11 +206,13 @@ func init() {
 	flag.StringVar(&configFile, "config", "", "Config file")
 	flag.BoolVar(&showVersion, "version", false, "Show version")
 	flag.BoolVar(&atrustAuthInfo, "auth-info", false, "Fetch aTrust authentication information, but not login")
+	flag.BoolVar(&atrustTrustDevice, "trust-device", false, "Trust the current device for aTrust with client data, but not connect")
+	flag.BoolVar(&atrustUntrustDevice, "untrust-device", false, "Untrust the current device for aTrust with client data, but not connect")
 
 	flag.Parse()
 
 	if showVersion {
-		fmt.Printf("ZJU Connect v%s\n", zjuConnectVersion)
+		fmt.Printf("ZJU Connect %s\n", zjuConnectVersionString())
 		os.Exit(0)
 	}
 
@@ -198,7 +222,7 @@ func init() {
 			os.Exit(1)
 		}
 		log.SetOutput(io.Discard) // suppress log
-		info, err := atrust.GetAuthInfoList(conf.ServerAddress, conf.ServerPort)
+		info, err := atrust.GetAuthInfoList(conf.ServerAddress, conf.ServerPort, conf.BindInterface, conf.AutoDetectInterface, conf.LocalDNSServer, conf.DebugTLSLogFile)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Get auth info list error:", err)
 			os.Exit(1)
@@ -209,6 +233,34 @@ func init() {
 			os.Exit(1)
 		}
 		fmt.Println(string(jsonInfo))
+		os.Exit(0)
+	}
+
+	if atrustTrustDevice || atrustUntrustDevice {
+		if conf.Protocol != "atrust" {
+			fmt.Fprintln(os.Stderr, "Trust/Untrust device is only supported by the atrust protocol")
+			os.Exit(1)
+		}
+		if conf.ClientDataFile == "" {
+			fmt.Fprintln(os.Stderr, "Client data file is required for trust/untrust device")
+			os.Exit(1)
+		}
+		clientData, err := os.ReadFile(conf.ClientDataFile)
+		if err != nil {
+			log.Printf("Read client data file error: %s", err)
+			os.Exit(1)
+		}
+
+		err = atrust.SetTrusted(conf.ServerAddress, conf.ServerPort, clientData, atrustTrustDevice, conf.BindInterface, conf.AutoDetectInterface, conf.LocalDNSServer, conf.DebugTLSLogFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Trust/Untrust device error:", err)
+			os.Exit(1)
+		}
+		if atrustTrustDevice {
+			log.Println("Device trusted successfully")
+		} else {
+			log.Println("Device untrusted successfully")
+		}
 		os.Exit(0)
 	}
 

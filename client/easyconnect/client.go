@@ -4,13 +4,24 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/mythologyli/zju-connect/client"
+	"github.com/mythologyli/zju-connect/internal/hook_func"
+	"github.com/mythologyli/zju-connect/internal/underlay"
 	"github.com/mythologyli/zju-connect/log"
 	"inet.af/netaddr"
+)
+
+const (
+	easyConnectHTTPTimeout           = 30 * time.Second
+	easyConnectDialTimeout           = 10 * time.Second
+	easyConnectResponseHeaderTimeout = 15 * time.Second
+	easyConnectRawRequestTimeout     = 15 * time.Second
 )
 
 type Client struct {
@@ -23,7 +34,10 @@ type Client struct {
 	parseResource     bool
 	useDomainResource bool
 
-	httpClient *http.Client
+	httpClient        *http.Client
+	underlayDialer    *underlay.Dialer
+	tlsKeyLogWriter   io.Writer
+	rawRequestTimeout time.Duration
 
 	twfID string
 	token *[48]byte
@@ -31,17 +45,27 @@ type Client struct {
 	lineList []string
 
 	ipResources     []client.IPResource
-	domainResources map[string]client.DomainResource
+	domainResources client.DomainResources
 	ipSet           *netaddr.IPSet
-	dnsResource     map[string]net.IP
+	dnsResource     map[string][]net.IP
 	dnsServer       string
+	dnsServers      []string
 
 	ip        net.IP // Client IP
 	ipReverse []byte
+
+	lifecycleCtx       context.Context
+	lifecycleCancel    context.CancelFunc
+	requestIPConn      net.Conn
+	requestIPConnMu    sync.Mutex
+	requestIPKeepAlive sync.Once
+	keepAliveStarted   sync.Once
+	closeOnce          sync.Once
 }
 
-func NewClient(server, username, password, totpSecret string, tlsCert tls.Certificate, twfID string, testMultiLine, parseResource, useDomainResource bool) *Client {
-	return &Client{
+func NewClient(server, username, password, totpSecret string, tlsCert tls.Certificate, twfID string, testMultiLine, parseResource, useDomainResource bool, underlayDialer *underlay.Dialer, tlsKeyLogWriter io.Writer) *Client {
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
+	c := &Client{
 		server:            server,
 		username:          username,
 		password:          password,
@@ -50,12 +74,31 @@ func NewClient(server, username, password, totpSecret string, tlsCert tls.Certif
 		testMultiLine:     testMultiLine,
 		parseResource:     parseResource,
 		useDomainResource: useDomainResource,
-		httpClient: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			}},
-		twfID: twfID,
+		httpClient:        &http.Client{Timeout: easyConnectHTTPTimeout},
+		underlayDialer:    underlayDialer,
+		tlsKeyLogWriter:   tlsKeyLogWriter,
+		rawRequestTimeout: easyConnectRawRequestTimeout,
+		twfID:             twfID,
+		lifecycleCtx:      lifecycleCtx,
+		lifecycleCancel:   lifecycleCancel,
 	}
+	c.setHTTPTransport(&tls.Config{InsecureSkipVerify: true})
+	return c
+}
+
+// Close releases background resources held by the client. Safe to call
+// multiple times.
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		c.lifecycleCancel()
+		c.httpClient.CloseIdleConnections()
+		c.requestIPConnMu.Lock()
+		if c.requestIPConn != nil {
+			_ = c.requestIPConn.Close()
+			c.requestIPConn = nil
+		}
+		c.requestIPConnMu.Unlock()
+	})
 }
 
 func (c *Client) IP() (net.IP, error) {
@@ -82,7 +125,7 @@ func (c *Client) IPResources() ([]client.IPResource, error) {
 	return c.ipResources, nil
 }
 
-func (c *Client) DomainResources() (map[string]client.DomainResource, error) {
+func (c *Client) DomainResources() (client.DomainResources, error) {
 	if c.domainResources == nil {
 		return nil, errors.New("domain resources not available")
 	}
@@ -90,7 +133,7 @@ func (c *Client) DomainResources() (map[string]client.DomainResource, error) {
 	return c.domainResources, nil
 }
 
-func (c *Client) DNSResource() (map[string]net.IP, error) {
+func (c *Client) DNSResource() (map[string][]net.IP, error) {
 	if c.dnsResource == nil {
 		return nil, errors.New("DNS resource not available")
 	}
@@ -106,6 +149,13 @@ func (c *Client) DNSServer() (string, error) {
 	return c.dnsServer, nil
 }
 
+func (c *Client) DNSServers() ([]string, error) {
+	if len(c.dnsServers) == 0 {
+		return nil, errors.New("DNS servers not available")
+	}
+	return append([]string(nil), c.dnsServers...), nil
+}
+
 func (c *Client) CanUseTCPTunnel() bool {
 	return false
 }
@@ -115,6 +165,13 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
 }
 
 func (c *Client) Setup(graphCodeFile string) error {
+	if c.underlayDialer == nil {
+		return errors.New("underlay dialer is required")
+	}
+	return c.setup(graphCodeFile)
+}
+
+func (c *Client) setup(graphCodeFile string) error {
 	// Use username/password/(SMS code) to get the TwfID
 	if c.twfID == "" {
 		err := c.requestTwfID(graphCodeFile)
@@ -135,7 +192,7 @@ func (c *Client) Setup(graphCodeFile string) error {
 			} else {
 				log.Printf("Line list: %v", c.lineList)
 
-				bestLine, err := findBestLine(c.lineList)
+				bestLine, err := findBestLine(c.lineList, c.dialContext, c.tlsKeyLogWriter)
 				if err != nil {
 					log.Printf("Error occurred while finding best line: %v", err)
 				} else {
@@ -147,7 +204,7 @@ func (c *Client) Setup(graphCodeFile string) error {
 						c.testMultiLine = false
 						c.twfID = ""
 
-						return c.Setup(graphCodeFile)
+						return c.setup(graphCodeFile)
 					}
 				}
 			}
@@ -187,5 +244,89 @@ func (c *Client) Setup(graphCodeFile string) error {
 		return err
 	}
 
+	// Periodic session keepalive. Without this, sangfor servers with strict
+	// idle policies (observed at HUST) close the session as idle, which
+	// surfaces as "broken pipe" + "unexpected handshake reply" panics in
+	// the L3 tunnel layer. The official EasyConnect client calls
+	// /por/update_session.csp; we mirror that. Guarded by sync.Once so the
+	// recursive Setup() path (testMultiLine) doesn't double-start.
+	c.keepAliveStarted.Do(func() {
+		hook_func.RegisterTerminalFunc("CloseSessionKeepAlive", func(ctx context.Context) error {
+			c.Close()
+			return nil
+		})
+		go c.sessionKeepAliveLoop()
+	})
+
 	return nil
+}
+
+func (c *Client) setHTTPTransport(tlsConfig *tls.Config) {
+	if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
+		transport.CloseIdleConnections()
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = c.dialContext
+	transport.TLSClientConfig = tlsConfig.Clone()
+	if c.tlsKeyLogWriter != nil {
+		transport.TLSClientConfig.KeyLogWriter = c.tlsKeyLogWriter
+	}
+	transport.ResponseHeaderTimeout = easyConnectResponseHeaderTimeout
+	c.httpClient.Transport = transport
+}
+
+func (c *Client) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if c.underlayDialer == nil {
+		return (&net.Dialer{Timeout: easyConnectDialTimeout, KeepAlive: 30 * time.Second}).DialContext(ctx, network, address)
+	}
+	return c.underlayDialer.DialContext(ctx, network, address)
+}
+
+func (c *Client) rawRequestContext() (context.Context, context.CancelFunc) {
+	timeout := c.rawRequestTimeout
+	if timeout <= 0 {
+		timeout = easyConnectRawRequestTimeout
+	}
+	return context.WithTimeout(c.lifecycleCtx, timeout)
+}
+
+func armConnectionContext(ctx context.Context, conn net.Conn) (func(), error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	return func() {
+		stopCancel()
+		_ = conn.SetDeadline(time.Time{})
+	}, nil
+}
+
+func (c *Client) sessionKeepAliveLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	c.runSessionKeepAlive(ticker.C, 10*time.Second)
+}
+
+func (c *Client) runSessionKeepAlive(ticks <-chan time.Time, requestTimeout time.Duration) {
+	for {
+		select {
+		case <-c.lifecycleCtx.Done():
+			return
+		case <-ticks:
+			ctx, cancel := context.WithTimeout(c.lifecycleCtx, requestTimeout)
+			err := c.requestUpdateSession(ctx)
+			cancel()
+			if err != nil {
+				if err == errNotFound {
+					log.Println("server does not support update_session, stopping keepalive")
+					return
+				}
+				log.Printf("update_session keepalive failed: %v", err)
+			}
+		}
+	}
 }

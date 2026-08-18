@@ -3,17 +3,19 @@
 package tun
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"sync"
 
 	"github.com/miekg/dns"
 	tun "github.com/mythologyli/sing-tun"
 	"github.com/mythologyli/zju-connect/client"
 	"github.com/mythologyli/zju-connect/internal/hook_func"
 	"github.com/mythologyli/zju-connect/internal/ippool"
+	"github.com/mythologyli/zju-connect/internal/ipresource"
 	"github.com/mythologyli/zju-connect/internal/zcdns"
 	"github.com/mythologyli/zju-connect/internal/zctcpip"
 	"github.com/mythologyli/zju-connect/log"
@@ -24,6 +26,7 @@ import (
 )
 
 const MTU uint32 = 1400
+const maxInboundPacketSize = 1500
 
 type Stack struct {
 	endpoint            *Endpoint
@@ -32,7 +35,10 @@ type Stack struct {
 	l3Conn              io.ReadWriteCloser
 	resolve             zcdns.LocalServer
 	ipResources         []client.IPResource
-	ipPool              *ippool.IPPool[client.DomainResource]
+	resourceIndexOnce   sync.Once
+	resourceIndex       *ipresource.Index
+	resourceCache       *resourceDecisionCache
+	ipPool              *ippool.IPPool[[]client.DomainResource]
 	fakeIP              bool
 }
 
@@ -40,7 +46,7 @@ func (s *Stack) SetupResolve(r zcdns.LocalServer) {
 	s.resolve = r
 }
 
-func (s *Stack) SetupIPPool(ipPool *ippool.IPPool[client.DomainResource]) {
+func (s *Stack) SetupIPPool(ipPool *ippool.IPPool[[]client.DomainResource]) {
 	s.ipPool = ipPool
 }
 
@@ -58,12 +64,17 @@ func (s *Stack) Run() {
 	if connErr != nil {
 		panic(connErr)
 	}
+	defer s.l3Conn.Close()
+
 	// Read from VPN server and send to TUN stack
 	go func() {
+		buf := make([]byte, maxInboundPacketSize+tun.PacketOffset)
 		for {
-			buf := make([]byte, MTU+tun.PacketOffset)
 			n, err := s.l3Conn.Read(buf)
 			if err != nil {
+				if hook_func.IsTerminal() {
+					return
+				}
 				panic(err)
 			}
 			log.DebugPrintf("Recv: read %d bytes", n)
@@ -82,8 +93,8 @@ func (s *Stack) Run() {
 	}()
 
 	// Read from TUN stack and send to VPN server
+	buf := make([]byte, MTU+tun.PacketOffset)
 	for {
-		buf := make([]byte, MTU+tun.PacketOffset)
 		n, err := s.endpoint.Read(buf)
 		if err != nil {
 			if hook_func.IsTerminal() {
@@ -140,40 +151,33 @@ func (s *Stack) processIPV4(packet zctcpip.IPv4Packet) error {
 		return fmt.Errorf("protocol %d not supported, skip", packet.Protocol())
 	}
 
-	domain, resource, ok := s.ipPool.GetDomain(packet.DestinationIP())
+	domain, resources, ok := s.ipPool.GetDomain(packet.DestinationIP())
 	if ok {
 		log.DebugPrintf("IP to domain %s", domain)
 
-		if resource.Protocol == protocol || resource.Protocol == "all" {
-			if protocol == "icmp" {
-				return s.processIPV4ICMP(packet, packet.Payload())
-			}
-
-			if resource.PortMin <= port && port <= resource.PortMax {
-				if protocol == "tcp" {
-					return s.processIPV4TCP(packet, packet.Payload())
-				} else {
-					return s.processIPV4UDP(packet, packet.Payload())
-				}
+		if _, matched := client.MatchDomainResource(resources, protocol, port); matched {
+			if protocol == "tcp" {
+				_, tcpTunnelMatched := client.MatchDomainResourceWhere(resources, protocol, port, func(resource client.DomainResource) bool {
+					return !resource.EnableTCPPrefL3
+				})
+				return s.processIPV4TCP(packet, packet.Payload(), tcpTunnelMatched)
+			} else {
+				return s.processIPV4UDP(packet, packet.Payload())
 			}
 		}
 	}
 
-	for _, resource := range s.ipResources {
-		if bytes.Compare(packet.DestinationIP(), resource.IPMin) >= 0 && bytes.Compare(packet.DestinationIP(), resource.IPMax) <= 0 {
-			if resource.Protocol == protocol || resource.Protocol == "all" {
-				if protocol == "icmp" {
-					return s.processIPV4ICMP(packet, packet.Payload())
-				}
-
-				if resource.PortMin <= port && port <= resource.PortMax {
-					if protocol == "tcp" {
-						return s.processIPV4TCP(packet, packet.Payload())
-					} else {
-						return s.processIPV4UDP(packet, packet.Payload())
-					}
-				}
-			}
+	if _, matched := s.matchStaticResource(packet.DestinationIP(), protocol, port); matched {
+		if protocol == "icmp" {
+			return s.processIPV4ICMP(packet, packet.Payload())
+		}
+		if protocol == "tcp" {
+			_, tcpTunnelMatched := s.resourceIndex.MatchWhere(packet.DestinationIP(), protocol, port, func(resource client.IPResource) bool {
+				return !resource.EnableTCPPrefL3
+			})
+			return s.processIPV4TCP(packet, packet.Payload(), tcpTunnelMatched)
+		} else {
+			return s.processIPV4UDP(packet, packet.Payload())
 		}
 	}
 
@@ -184,17 +188,44 @@ func (s *Stack) processIPV4(packet zctcpip.IPv4Packet) error {
 	}
 }
 
-func (s *Stack) processIPV4TCP(packet zctcpip.IPv4Packet, tcpPacket zctcpip.TCPPacket) error {
+func (s *Stack) matchesStaticResource(destination net.IP, protocol string, port int) bool {
+	ip, ok := ipresource.IPv4Uint32(destination)
+	if !ok {
+		return false
+	}
+	s.resourceIndexOnce.Do(func() {
+		s.resourceIndex = ipresource.New(s.ipResources)
+		s.resourceCache = newResourceDecisionCache()
+	})
+	key := resourceDecisionKey{ip: ip, protocol: protocol, port: port}
+	if decision, ok := s.resourceCache.get(key); ok {
+		return decision
+	}
+	_, decision := s.resourceIndex.Match(destination, protocol, port)
+	s.resourceCache.set(key, decision)
+	return decision
+}
+
+func (s *Stack) matchStaticResource(destination net.IP, protocol string, port int) (client.IPResource, bool) {
+	s.resourceIndexOnce.Do(func() {
+		s.resourceIndex = ipresource.New(s.ipResources)
+		s.resourceCache = newResourceDecisionCache()
+	})
+	return s.resourceIndex.Match(destination, protocol, port)
+}
+
+func (s *Stack) processIPV4TCP(packet zctcpip.IPv4Packet, tcpPacket zctcpip.TCPPacket, useTCPTunnel bool) error {
 	log.DebugPrintf("receive tcp %s:%d -> %s:%d", packet.SourceIP(), tcpPacket.SourcePort(), packet.DestinationIP(), tcpPacket.DestinationPort())
 
 	if !packet.DestinationIP().IsGlobalUnicast() {
 		return s.endpoint.Write(packet)
 	}
 
-	if s.endpoint.client.CanUseTCPTunnel() {
+	if useTCPTunnel && s.endpoint.client.CanUseTCPTunnel() {
 		pkt := gvisorstack.NewPacketBuffer(gvisorstack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(packet),
 		})
+		defer pkt.DecRef()
 		s.tcpListenerEndpoint.dispatcher.DeliverNetworkPacket(ipv4.ProtocolNumber, pkt)
 		return nil
 	}

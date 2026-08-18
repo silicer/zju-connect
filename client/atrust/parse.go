@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/mythologyli/zju-connect/client"
+	"github.com/mythologyli/zju-connect/internal/ipresource"
 	"github.com/mythologyli/zju-connect/log"
 	"inet.af/netaddr"
 )
@@ -16,16 +17,7 @@ type ClientResource struct {
 		AppList struct {
 			Data struct {
 				AppInfo []struct {
-					Apps []struct {
-						ID          string
-						NodeGroupID string
-						AddressList []struct {
-							Protocol string
-							Port     string
-							Host     string
-							IP       []string
-						}
-					}
+					Apps []resourceApp
 				}
 
 				Config struct {
@@ -48,6 +40,14 @@ type ClientResource struct {
 		SDPPolicy struct {
 			Data struct {
 				ClientOption struct {
+					Tun0RTT struct {
+						MaxIdleConnNum    int64 `json:"maxIdleConnNum"`
+						MaxIdleLingerTime int64 `json:"maxIdleLingerTime"`
+						MinIdleConnNum    int64 `json:"minIdleConnNum"`
+						Enable            bool  `json:"enable"`
+						PreConnNum        int64 `json:"preConnNum"`
+					} `json:"tun0rtt"`
+
 					DNSOption struct {
 						FirstDNS  string
 						SecondDNS string
@@ -63,6 +63,21 @@ type ClientResource struct {
 	}
 }
 
+type resourceApp struct {
+	ID              string
+	NodeGroupID     string
+	AccessModel     string
+	EnableTCPPrefL3 bool
+	AddressList     []resourceAddress
+}
+
+type resourceAddress struct {
+	Protocol string
+	Port     string
+	Host     string
+	IP       []string
+}
+
 func (c *Client) parseResource(resource []byte) error {
 	log.Println("Parsing resource...")
 
@@ -74,11 +89,15 @@ func (c *Client) parseResource(resource []byte) error {
 
 	ipSetBuilder := netaddr.IPSetBuilder{}
 	c.ipResources = make([]client.IPResource, 0)
-	c.domainResources = make(map[string]client.DomainResource)
-	c.dnsResource = make(map[string]net.IP)
+	c.domainResources = make(client.DomainResources)
+	c.dnsResource = make(map[string][]net.IP)
 
 	for _, app := range clientResource.Data.AppList.Data.AppInfo {
 		for _, appItem := range app.Apps {
+			if appItem.AccessModel != "L3VPN" {
+				log.DebugPrintf("Ignore unsupported aTrust access model %q for app %s", appItem.AccessModel, appItem.ID)
+				continue
+			}
 			for _, address := range appItem.AddressList {
 				if address.Protocol == "tcp" || address.Protocol == "udp" || address.Protocol == "all" {
 					// Handle port
@@ -128,13 +147,14 @@ func (c *Client) parseResource(resource []byte) error {
 								ipSetBuilder.AddPrefix(netaddr.MustParseIPPrefix(hostStr))
 
 								c.ipResources = append(c.ipResources, client.IPResource{
-									IPMin:       ip4.To16(),
-									IPMax:       ipMax4.To16(),
-									PortMin:     portMin,
-									PortMax:     portMax,
-									Protocol:    address.Protocol,
-									AppID:       appItem.ID,
-									NodeGroupID: appItem.NodeGroupID,
+									IPMin:           ip4.To16(),
+									IPMax:           ipMax4.To16(),
+									PortMin:         portMin,
+									PortMax:         portMax,
+									Protocol:        address.Protocol,
+									AppID:           appItem.ID,
+									NodeGroupID:     appItem.NodeGroupID,
+									EnableTCPPrefL3: appItem.EnableTCPPrefL3,
 								})
 
 								log.DebugPrintf("Add CIDR: %s (%s ~ %s), Port range: %d ~ %d, [%s]", hostStr, ip4, ipMax4, portMin, portMax, address.Protocol)
@@ -150,13 +170,14 @@ func (c *Client) parseResource(resource []byte) error {
 									ipSetBuilder.AddRange(netaddr.IPRangeFrom(netaddr.MustParseIP(ipMin.String()), netaddr.MustParseIP(ipMax.String())))
 
 									c.ipResources = append(c.ipResources, client.IPResource{
-										IPMin:       ipMin,
-										IPMax:       ipMax,
-										PortMin:     portMin,
-										PortMax:     portMax,
-										Protocol:    address.Protocol,
-										AppID:       appItem.ID,
-										NodeGroupID: appItem.NodeGroupID,
+										IPMin:           ipMin,
+										IPMax:           ipMax,
+										PortMin:         portMin,
+										PortMax:         portMax,
+										Protocol:        address.Protocol,
+										AppID:           appItem.ID,
+										NodeGroupID:     appItem.NodeGroupID,
+										EnableTCPPrefL3: appItem.EnableTCPPrefL3,
 									})
 
 									log.DebugPrintf("Add IP range: %s ~ %s, Port range: %d ~ %d, [%s]", ipMin, ipMax, portMin, portMax, address.Protocol)
@@ -175,13 +196,14 @@ func (c *Client) parseResource(resource []byte) error {
 							ipSetBuilder.Add(netaddr.MustParseIP(ip.String()))
 
 							c.ipResources = append(c.ipResources, client.IPResource{
-								IPMin:       ip,
-								IPMax:       ip,
-								PortMin:     portMin,
-								PortMax:     portMax,
-								Protocol:    address.Protocol,
-								AppID:       appItem.ID,
-								NodeGroupID: appItem.NodeGroupID,
+								IPMin:           ip,
+								IPMax:           ip,
+								PortMin:         portMin,
+								PortMax:         portMax,
+								Protocol:        address.Protocol,
+								AppID:           appItem.ID,
+								NodeGroupID:     appItem.NodeGroupID,
+								EnableTCPPrefL3: appItem.EnableTCPPrefL3,
 							})
 
 							log.DebugPrintf("Add IP: %s, Port range: %d ~ %d, [%s]", ip, portMin, portMax, address.Protocol)
@@ -191,13 +213,19 @@ func (c *Client) parseResource(resource []byte) error {
 					}
 
 					if isDomain {
-						c.domainResources[strings.ReplaceAll(hostStr, "*", "")] = client.DomainResource{
-							PortMin:     portMin,
-							PortMax:     portMax,
-							Protocol:    address.Protocol,
-							AppID:       appItem.ID,
-							NodeGroupID: appItem.NodeGroupID,
+						domain := normalizePolicyDomain(hostStr)
+						if domain == "" {
+							log.DebugPrintf("Ignore unsupported domain pattern: %s", hostStr)
+							continue
 						}
+						c.domainResources[domain] = append(c.domainResources[domain], client.DomainResource{
+							PortMin:         portMin,
+							PortMax:         portMax,
+							Protocol:        address.Protocol,
+							AppID:           appItem.ID,
+							NodeGroupID:     appItem.NodeGroupID,
+							EnableTCPPrefL3: appItem.EnableTCPPrefL3,
+						})
 
 						log.DebugPrintf("Add domain: %s, Port range: %d ~ %d, [%s]", hostStr, portMin, portMax, address.Protocol)
 					}
@@ -214,10 +242,13 @@ func (c *Client) parseResource(resource []byte) error {
 							if ip != nil {
 								if ip.To4() != nil {
 									ipSetBuilder.Add(netaddr.MustParseIP(ip.String()))
-									c.dnsResource[hostStr] = ip
+									c.dnsResource[hostStr] = append(c.dnsResource[hostStr], ip)
+									c.ipResources = append(c.ipResources, client.IPResource{
+										IPMin: ip, IPMax: ip, PortMin: portMin, PortMax: portMax,
+										Protocol: address.Protocol, AppID: appItem.ID, NodeGroupID: appItem.NodeGroupID,
+										EnableTCPPrefL3: appItem.EnableTCPPrefL3,
+									})
 									log.DebugPrintf("Add DNS rule: %s -> %s", hostStr, ipStr)
-
-									break // TODO: handle multiple IPs for the same domain
 								} else {
 									log.DebugPrintf("IPv6 address found: %s, skipping", ip)
 								}
@@ -231,48 +262,77 @@ func (c *Client) parseResource(resource []byte) error {
 		}
 	}
 
-	if clientResource.Data.SDPPolicy.Data.ClientOption.DNSOption.FirstDNS != "" {
-		c.dnsServer = clientResource.Data.SDPPolicy.Data.ClientOption.DNSOption.FirstDNS
-		log.DebugPrintf("Set DNS server: %s", c.dnsServer)
-	} else if clientResource.Data.SDPPolicy.Data.ClientOption.DNSOptionV2.FirstDNS != "" {
-		c.dnsServer = clientResource.Data.SDPPolicy.Data.ClientOption.DNSOptionV2.FirstDNS
-		log.DebugPrintf("Set DNS server: %s", c.dnsServer)
+	dnsOption := clientResource.Data.SDPPolicy.Data.ClientOption.DNSOption
+	if dnsOption.FirstDNS == "" {
+		dnsOption = clientResource.Data.SDPPolicy.Data.ClientOption.DNSOptionV2
+	}
+	c.dnsServers = c.dnsServers[:0]
+	for _, server := range []string{dnsOption.FirstDNS, dnsOption.SecondDNS} {
+		if server != "" {
+			c.dnsServers = append(c.dnsServers, server)
+		}
+	}
+	if len(c.dnsServers) > 0 {
+		c.dnsServer = c.dnsServers[0]
+		log.DebugPrintf("Set DNS servers: %v", c.dnsServers)
 	} else {
+		c.dnsServer = ""
 		log.DebugPrintf("No DNS server found")
 	}
-
 	c.MajorNodeGroup = clientResource.Data.AppList.Data.Config.NodeGroupConf.MajorNodeGroup.ID
-	c.NodeGroups = make(map[string][]string)
+	c.NodeGroups = make(map[string]NodeGroup)
 	for _, nodeGroup := range clientResource.Data.AppList.Data.Config.NodeGroupConf.NodeGroupList {
-		addressList := make([]string, 0)
+		addresses := NodeGroup{}
 		for _, addressInfo := range nodeGroup.AddressInfo {
-			if addressInfo.Type == "wan" {
-				address := addressInfo.Address
-				if address == "{{sdpcHost}}" {
-					address = c.serverAddress
-				}
-				if !strings.Contains(address, ":") {
-					address += ":441"
-				}
-				addressList = append(addressList, address)
+			address := addressInfo.Address
+			if address == "{{sdpcHost}}" {
+				address = c.serverAddress
+			}
+			if !strings.Contains(address, ":") {
+				address += ":441"
+			}
+			switch strings.ToLower(addressInfo.Type) {
+			case "wan":
+				addresses.WAN = append(addresses.WAN, address)
+			case "lan":
+				addresses.LAN = append(addresses.LAN, address)
+			default:
+				log.DebugPrintf("Ignore node with unsupported type %q: %s", addressInfo.Type, address)
+			}
 
-				// Remove ip from ipSetBuilder to prevent circular routing
-				host, _, err := net.SplitHostPort(address)
-				if err != nil {
-					continue
-				}
-				ip := net.ParseIP(host)
-				if ip != nil && ip.To4() != nil {
-					ipSetBuilder.Remove(netaddr.MustParseIP(ip.String()))
-					log.DebugPrintf("Remove IP from IP set to prevent circular routing: %s", ip)
-				}
+			// Remove ip from ipSetBuilder to prevent circular routing
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				continue
+			}
+			ip := net.ParseIP(host)
+			if ip != nil && ip.To4() != nil {
+				ipSetBuilder.Remove(netaddr.MustParseIP(ip.String()))
+				log.DebugPrintf("Remove IP from IP set to prevent circular routing: %s", ip)
 			}
 		}
-		c.NodeGroups[nodeGroup.ID] = addressList
-		log.DebugPrintf("Node Group ID: %s, Addresses: %v", nodeGroup.ID, addressList)
+		c.NodeGroups[nodeGroup.ID] = addresses
+		log.DebugPrintf(
+			"Node Group ID: %s, WAN Addresses: %v, LAN Addresses: %v",
+			nodeGroup.ID,
+			addresses.WAN,
+			addresses.LAN,
+		)
 	}
 
 	c.ipSet, _ = ipSetBuilder.IPSet()
+	c.resourceIndex = ipresource.New(c.ipResources)
 
 	return nil
+}
+
+func normalizePolicyDomain(domain string) string {
+	domain = strings.TrimSpace(domain)
+	if strings.HasPrefix(domain, "*.") {
+		return domain[1:]
+	}
+	if strings.Contains(domain, "*") {
+		return ""
+	}
+	return domain
 }
